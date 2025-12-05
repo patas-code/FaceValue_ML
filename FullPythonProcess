@@ -1,0 +1,106 @@
+## ------------------------ STEP 0) IMPORT LIBRARIES---------------------------------------------
+from pyfirmata2 import Arduino, util
+import numpy as np
+import pandas as pd
+import time
+import pickle
+import joblib
+from keras.models import load_model
+import serial
+import sys
+import time
+import os
+import matplotlib as plt
+import inspect
+
+## -------------------- STEP 1) COLLECTING EMG SIGNALS FROM ARDUINO --------------------------------------
+# cata comment: set up Arduino connection & initialize pins here (MAKE SURE ARDUINO FIRMATA SKETCH IS RUNNING)
+Port = Arduino.AUTODETECT #auto-detects our COM port so we aren't cringe and looking for it
+pin = 0  # leave pin as blank before we call for each EMG sensor
+    # Start iterator to receive input data
+
+
+# cata comment: "class" is a trigger word that allows us to group funfctions together
+class AnalogPrinter:
+    # cata commen: thsi function initializes the sampling rate & time of the Arduino
+    def __init__(self):
+        # sampling rate: 10Hz
+        self.samplingRate = 9600
+        self.timestamp = 0
+        self.board = Arduino(Port)
+        it = util.Iterator(self.board)
+        it.start()
+    # cata comment: this function begins the data acquisition from the Arduino
+    def start(self):
+        self.board.analog[pin].register_callback(self.myPrintCallback)
+        self.board.samplingOn(9600)
+        self.board.analog[pin].enable_reporting()
+    # cata comment: this function prints out the data acquired
+    def myPrintCallback(self, data):
+        print("%f,%f" % (self.timestamp, data))
+        self.timestamp += (1 / self.samplingRate)
+    #cata comment: this function stops data collection
+    def stop(self):
+        self.board.exit()
+
+
+# cata comment: give the user a signal and instructions to begin data collection
+print("Please scrunch your face every time you see 'SCRUNCH' appear on the screen.")
+time.sleep(5)
+
+# collect EMG data from forehead
+pin = 1
+analogPrinter = AnalogPrinter()
+analogPrinter.start()
+print("SCRUNCH")
+forehead = self.board.analog[pin].read()
+time.sleep(1) # collect EMG for 1 second
+analogPrinter.stop()
+print(forehead)
+
+# collect EMG data from right cheek
+pin = 2
+analogPrinter = AnalogPrinter()
+analogPrinter.start()
+print("SCRUNCH")
+time.sleep(1) # collect EMG for 1 second
+analogPrinter.stop()
+
+# collect EMG data from left cheek
+pin = 3
+analogPrinter = AnalogPrinter()
+analogPrinter.start()
+print("SCRUNCH")
+time.sleep(1) # collect EMG for 1 second
+analogPrinter.stop()
+
+# collect EMG data from right jaw
+pin = 4
+analogPrinter = AnalogPrinter()
+analogPrinter.start()
+print("SCRUNCH")
+time.sleep(1) # collect EMG for 1 second
+analogPrinter.stop()
+
+# collect EMG data from left jaw
+pin = 5
+analogPrinter = AnalogPrinter()
+analogPrinter.start()
+print("SCRUNCH")
+time.sleep(1) # collect EMG for 1 second
+analogPrinter.stop()
+
+print("Finished collecting EMG signals. You may now take off the EMG electrodes")
+time.sleep(2)
+print("Running your data through the ML model now...")
+
+
+# cata comment: visualize EMG signals to make sure they match the ML model's training data
+plt.pyplot.plot(forehead)
+plt.pyplot.title('Forehead EMG Signal')
+plt.pyplot.xlabel('Time (ms)')
+plt.pyplot.ylabel('mV')
+## -------------------- STEP 2) RUNNING ML MODEL--------------------------------------
+# cata comment: Load the saved ML model (make sure you're in the right directory)
+model = load_model('EMGClassifier.hdf5')
+#visualize results from each signal before trianing so we can 
