@@ -1,0 +1,86 @@
+## Bioinstrumentation FaceValue Project
+
+
+# load in libraries for formatting datasets into numpy arrays
+import numpy as np
+import pandas as pd
+from Arduino import Arduino
+import time
+import pickle
+import h5py
+import scipy.io
+import sklearn
+from sklearn.model_selection import train_test_split
+import tensorflow
+import keras
+import matplotlib.pyplot as plt
+from keras import Sequential
+from keras.layers import Conv1D, MaxPooling1D, Flatten, Dropout, Dense, BatchNormalization, Input, Lambda, Activation, Conv2D, MaxPooling2D, Reshape, Bidirectional, TimeDistributed, GRU, GlobalMaxPooling1D
+from keras.layers import concatenate
+from keras.models import Model
+from keras.utils import plot_model
+from keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, CSVLogger, EarlyStopping
+from keras.optimizers import Adam
+from tensorflow.keras.models import load_model
+
+# ----> bring in training dataset used by ALSNet
+
+xtrain=pd.read_pickle('ALSdata\X_train.pkl')
+ytrain=pd.read_pickle('ALSdata\y_train.pkl')
+xtest=pd.read_pickle('ALSdata\X_test.pkl')
+ytest=pd.read_pickle('ALSdata\y_test.pkl')
+
+
+
+xtrain=np.array(xtrain)
+xtrain=xtrain.reshape(2657,23437,1)
+
+
+xtest=np.array(xtest)
+xtest=xtest.reshape(665,23437,1)
+
+def CNN_fibo():
+    input_layer = Input(shape=(23437, 1),
+                        name='input_layer')
+
+    conv1 = Conv1D(filters=32, kernel_size=11, padding='valid', dilation_rate=1, activation='relu',
+                   kernel_initializer='he_normal', name='conv1')(input_layer)
+    conv1 = BatchNormalization(name='conv1_bn')(conv1)
+
+
+    conv2 = Conv1D(filters=64, kernel_size=9, padding='valid', dilation_rate=2, activation='relu',
+                   kernel_initializer='he_normal', name='conv2')(conv1)
+    conv2 = BatchNormalization(name='conv2_bn')(conv2)
+
+    conv3 = Conv1D(filters=128, kernel_size=7, padding='valid', dilation_rate=3, activation='relu',
+                   kernel_initializer='he_normal', name='conv3')(conv2)
+    conv3 = BatchNormalization(name='conv3_bn')(conv3)
+
+
+    
+    max_pool = GlobalMaxPooling1D(data_format = 'channels_last')(conv3)
+#     flatten_block = Flatten()(max_pool)
+
+
+    emg_block = Dense(64, activation='relu', name='emg_dense1')(max_pool)
+    emg_block = BatchNormalization(name='emg_dense1_bn')(emg_block)
+    
+    emg = Dense(1, activation='sigmoid', name='emg')(emg_block)
+
+    model = Model(inputs=input_layer, outputs=emg)
+
+    return model
+
+model= CNN_fibo()
+model.summary()
+
+
+
+modelWeightPath = './weight.hdf5'
+modelLogPath = './trainingLog.csv'
+
+
+lr = 1e-3
+opt = Adam(lr=lr, beta_1=0.9,beta_2=0.999, amsgrad= False, epsilon=None)
+model.compile(optimizer=opt, loss='binary_crossentropy', metrics=[])
+model.load_weights(modelWeightPath)
