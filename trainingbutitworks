@@ -1,0 +1,796 @@
+import numpy as np
+import pandas as pd
+import pickle
+import os
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+# TensorFlow/Keras imports
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, TensorBoard
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+class EMGDataLoader:
+    """Class to load and preprocess EMG data and labels from pickle files"""
+    
+    def __init__(self, data_dir=None):
+        self.data_dir = data_dir
+        self.x_data = []
+        self.y_data = []
+        self.sample_ids = []
+        self.sequence_length = None
+        self.num_features = None
+        
+    def load_data_and_labels(self, data_files, label_files, sample_ids=None):
+        """
+        Load EMG data and corresponding labels from pickle files
+        
+        Args:
+            data_files: List of file paths to EMG data .pkl files
+            label_files: List of file paths to label .pkl files (same order as data_files)
+            sample_ids: Optional list of sample identifiers
+        """
+        if len(data_files) != len(label_files):
+            raise ValueError(f"Number of data files ({len(data_files)}) must match number of label files ({len(label_files)})")
+        
+        self.x_data = []
+        self.y_data = []
+        self.sample_ids = sample_ids if sample_ids else []
+        
+        print(f"Loading {len(data_files)} data-label pairs...")
+        
+        for idx, (data_file, label_file) in enumerate(zip(data_files, label_files)):
+            try:
+                # Load EMG data
+                with open(data_file, 'rb') as f:
+                    data_content = pickle.load(f)
+                
+                # Load label
+                with open(label_file, 'rb') as f:
+                    label_content = pickle.load(f)
+                
+                # Process EMG data
+                x_sample = self._process_emg_data(data_content)
+                
+                # Process label (handle different label formats)
+                y_sample = self._process_label(label_content)
+                
+                self.x_data.append(x_sample)
+                self.y_data.append(y_sample)
+                
+                if not sample_ids:
+                    self.sample_ids.append(f"sample_{idx}")
+                
+                if (idx + 1) % 10 == 0:
+                    print(f"Loaded {idx + 1}/{len(data_files)} files...")
+                    
+            except Exception as e:
+                print(f"Error loading pair {data_file} and {label_file}: {e}")
+        
+        # Convert to numpy arrays
+        self.x_data = np.array(self.x_data)
+        self.y_data = np.array(self.y_data)
+        
+        # Get data dimensions
+        if len(self.x_data.shape) == 3:
+            self.num_samples, self.sequence_length, self.num_features = self.x_data.shape
+        elif len(self.x_data.shape) == 2:
+            self.num_samples, self.num_features = self.x_data.shape
+            self.sequence_length = None
+        else:
+            raise ValueError(f"Unexpected data shape: {self.x_data.shape}")
+        
+        print(f"\nSuccessfully loaded {self.num_samples} samples")
+        print(f"X shape: {self.x_data.shape}")
+        print(f"Y shape: {self.y_data.shape}")
+        print(f"Class distribution: {Counter(self.y_data)}")
+        
+        return self.x_data, self.y_data
+    
+    def load_from_directories(self, data_dir, labels_dir, file_pattern="*.pkl"):
+        """
+        Load all .pkl files from two directories (data and labels)
+        Assumes matching filenames in both directories
+        """
+        data_dir = Path('/content/drive/MyDrive/FaceValue_Project/EMG4ML/X_train2.pkl')
+        labels_dir = Path('/content/drive/MyDrive/FaceValue_Project/EMG4ML/y_train2.pkl')
+        
+        # Get all .pkl files from both directories
+        data_files = sorted(list(data_dir.glob(file_pattern)))
+        label_files = sorted(list(labels_dir.glob(file_pattern)))
+        
+        # Create mapping between data and label files
+        # This assumes same filenames in both directories
+        data_files_list = []
+        label_files_list = []
+        sample_ids_list = []
+        
+        for data_file in data_files:
+            # Look for matching label file
+            label_file = labels_dir / data_file.name
+            
+            if label_file.exists():
+                data_files_list.append(str(data_file))
+                label_files_list.append(str(label_file))
+                sample_ids_list.append(data_file.stem)
+            else:
+                print(f"Warning: No matching label file for {data_file.name}")
+        
+        print(f"Found {len(data_files_list)} matching data-label pairs")
+        
+        return self.load_data_and_labels(data_files_list, label_files_list, sample_ids_list)
+    
+    def load_with_mapping(self, data_dir, labels_dir, mapping_file=None):
+        """
+        Load data and labels using a mapping file
+        Useful when filenames don't match
+        """
+        data_dir = Path(data_dir)
+        labels_dir = Path(labels_dir)
+        
+        # If mapping file is provided
+        if mapping_file:
+            with open(mapping_file, 'r') as f:
+                mappings = [line.strip().split(',') for line in f.readlines()]
+            
+            data_files_list = []
+            label_files_list = []
+            sample_ids_list = []
+            
+            for data_filename, label_filename in mappings:
+                data_file = data_dir / data_filename
+                label_file = labels_dir / label_filename
+                
+                if data_file.exists() and label_file.exists():
+                    data_files_list.append(str(data_file))
+                    label_files_list.append(str(label_file))
+                    sample_ids_list.append(data_file.stem)
+                else:
+                    print(f"Warning: Missing files for mapping {data_filename} -> {label_filename}")
+        
+        return self.load_data_and_labels(data_files_list, label_files_list, sample_ids_list)
+    
+    def _process_emg_data(self, data):
+        """Process EMG data which may include time and voltage information"""
+        # Handle different possible data structures
+        if isinstance(data, dict):
+            # If data is a dictionary
+            if 'emg' in data:
+                emg_signal = data['emg']
+            elif 'voltage' in data:
+                emg_signal = data['voltage']
+            elif 'signal' in data:
+                emg_signal = data['signal']
+            elif 'data' in data:
+                emg_signal = data['data']
+            elif 'EMG' in data:
+                emg_signal = data['EMG']
+            else:
+                # Try to find any array-like data
+                for key, value in data.items():
+                    if hasattr(value, 'shape') and len(value.shape) >= 1:
+                        emg_signal = value
+                        break
+                else:
+                    # Use the entire dictionary values if they're numeric
+                    emg_signal = np.array(list(data.values()))
+        elif isinstance(data, np.ndarray):
+            emg_signal = data
+        elif isinstance(data, pd.DataFrame):
+            # If data is a DataFrame
+            emg_signal = data.values
+        elif isinstance(data, list):
+            emg_signal = np.array(data)
+        else:
+            raise ValueError(f"Unsupported data type: {type(data)}")
+        
+        # Ensure the signal is 2D: (timesteps, features)
+        if len(emg_signal.shape) == 1:
+            emg_signal = emg_signal.reshape(-1, 1)
+        
+        return emg_signal
+    
+    def _process_label(self, label_data):
+        """Process label data from pickle file"""
+        # Handle different label formats
+        
+        # If label is already a simple value
+        if isinstance(label_data, (int, float, np.integer, np.floating)):
+            return int(label_data)
+        
+        # If label is in a dictionary
+        elif isinstance(label_data, dict):
+            if 'label' in label_data:
+                return int(label_data['label'])
+            elif 'diagnosis' in label_data:
+                diagnosis = label_data['diagnosis']
+                # Convert string diagnosis to numeric
+                if isinstance(diagnosis, str):
+                    if 'als' in diagnosis.lower() or '1' in str(diagnosis):
+                        return 1
+                    else:
+                        return 0
+                else:
+                    return int(diagnosis)
+            elif 'class' in label_data:
+                return int(label_data['class'])
+            else:
+                # Try to find any numeric value
+                for key, value in label_data.items():
+                    if isinstance(value, (int, float, np.integer, np.floating)):
+                        return int(value)
+        
+        # If label is in an array/list
+        elif isinstance(label_data, (np.ndarray, list)):
+            # Take the first element if it's an array
+            if len(label_data) > 0:
+                return int(label_data[0])
+            else:
+                raise ValueError("Empty label array")
+        
+        # If label is a string
+        elif isinstance(label_data, str):
+            label_str = label_data.lower()
+            if 'als' in label_str or 'positive' in label_str or '1' in label_str:
+                return 1
+            else:
+                return 0
+        
+        else:
+            raise ValueError(f"Unsupported label format: {type(label_data)}")
+    
+    def create_sequences(self, sequence_length=100, step_size=50):
+        """
+        Create sequences from long EMG recordings
+        Useful for time-series classification
+        """
+        if self.sequence_length is not None:
+            print("Data already has sequence dimension")
+            return self.x_data, self.y_data
+        
+        sequences = []
+        sequence_labels = []
+        sequence_ids = []
+        
+        for signal, label, sample_id in zip(self.x_data, self.y_data, self.sample_ids):
+            if len(signal) >= sequence_length:
+                for start in range(0, len(signal) - sequence_length + 1, step_size):
+                    end = start + sequence_length
+                    sequences.append(signal[start:end])
+                    sequence_labels.append(label)
+                    sequence_ids.append(f"{sample_id}_seq{start}")
+        
+        self.x_data = np.array(sequences)
+        self.y_data = np.array(sequence_labels)
+        self.sample_ids = sequence_ids
+        
+        self.num_samples, self.sequence_length, self.num_features = self.x_data.shape
+        
+        print(f"Created {self.num_samples} sequences of length {self.sequence_length}")
+        print(f"New class distribution: {Counter(self.y_data)}")
+        
+        return self.x_data, self.y_data
+    
+    def normalize_data(self, scaler=None):
+        """Normalize the EMG data"""
+        if scaler is None:
+            scaler = StandardScaler()
+        
+        original_shape = self.x_data.shape
+        
+        # Reshape for normalization
+        x_flat = self.x_data.reshape(-1, self.x_data.shape[-1])
+        x_norm = scaler.fit_transform(x_flat).reshape(original_shape)
+        
+        self.x_data = x_norm
+        
+        return scaler
+
+def create_balanced_split(x_data, y_data, test_size=0.2, val_size=0.2, random_state=42):
+    """Create train/val/test splits with balanced classes"""
+    
+    # First split: train+val vs test
+    x_train_val, x_test, y_train_val, y_test = train_test_split(
+        x_data, y_data, 
+        test_size=test_size, 
+        stratify=y_data, 
+        random_state=random_state
+    )
+    
+    # Second split: train vs val
+    val_ratio = val_size / (1 - test_size)
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_train_val, y_train_val, 
+        test_size=val_ratio, 
+        stratify=y_train_val, 
+        random_state=random_state
+    )
+    
+    print(f"Train set: {len(x_train)} samples (Class 0: {sum(y_train==0)}, Class 1: {sum(y_train==1)})")
+    print(f"Validation set: {len(x_val)} samples (Class 0: {sum(y_val==0)}, Class 1: {sum(y_val==1)})")
+    print(f"Test set: {len(x_test)} samples (Class 0: {sum(y_test==0)}, Class 1: {sum(y_test==1)})")
+    
+    return (x_train, y_train), (x_val, y_val), (x_test, y_test)
+
+def build_attention_cnn_lstm_model(input_shape, num_classes=2):
+    """Build a CNN-LSTM model with attention mechanism"""
+    
+    inputs = layers.Input(shape=input_shape)
+    
+    # CNN feature extraction
+    x = layers.Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling1D(pool_size=2)(x)
+    
+    x = layers.Conv1D(filters=128, kernel_size=3, activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling1D(pool_size=2)(x)
+    
+    x = layers.Conv1D(filters=256, kernel_size=3, activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling1D(pool_size=2)(x)
+    
+    # LSTM with attention
+    lstm_out = layers.LSTM(128, return_sequences=True, dropout=0.3)(x)
+    
+    # Attention mechanism
+    attention = layers.Dense(1, activation='tanh')(lstm_out)
+    attention = layers.Flatten()(attention)
+    attention = layers.Activation('softmax')(attention)
+    attention = layers.RepeatVector(128)(attention)
+    attention = layers.Permute([2, 1])(attention)
+    
+    sent_representation = layers.Multiply()([lstm_out, attention])
+    sent_representation = layers.Lambda(lambda xin: tf.keras.backend.sum(xin, axis=1))(sent_representation)
+    
+    # Dense layers
+    x = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(0.001))(sent_representation)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(32, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.Dropout(0.3)(x)
+    
+    # Output layer
+    if num_classes == 2:
+        outputs = layers.Dense(1, activation='sigmoid')(x)
+    else:
+        outputs = layers.Dense(num_classes, activation='softmax')(x)
+    
+    model = models.Model(inputs=inputs, outputs=outputs)
+    
+    return model
+
+def train_binary_classifier(x_train, y_train, x_val, y_val, input_shape):
+    """Train a binary classifier for ALS detection"""
+    
+    # Build model
+    model = build_attention_cnn_lstm_model(input_shape, num_classes=1)
+    
+    # Compile model
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss='binary_crossentropy',
+        metrics=[
+            'accuracy',
+            keras.metrics.AUC(name='auc'),
+            keras.metrics.Precision(name='precision'),
+            keras.metrics.Recall(name='recall')
+        ]
+    )
+    
+    # Callbacks
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=20,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+            verbose=1
+        ),
+        ModelCheckpoint(
+            'best_als_model.h5',
+            monitor='val_auc',
+            mode='max',
+            save_best_only=True,
+            verbose=1
+        ),
+        TensorBoard(
+            log_dir='./logs',
+            histogram_freq=1
+        )
+    ]
+    
+    # Calculate class weights for imbalanced data
+    class_counts = np.bincount(y_train)
+    total = len(y_train)
+    class_weights = {
+        0: total / (2 * class_counts[0]),
+        1: total / (2 * class_counts[1])
+    }
+    
+    print(f"Class weights: {class_weights}")
+    
+    # Train model
+    history = model.fit(
+        x_train, y_train,
+        validation_data=(x_val, y_val),
+        epochs=100,
+        batch_size=32,
+        callbacks=callbacks,
+        class_weight=class_weights,
+        verbose=1
+    )
+    
+    return model, history
+
+def evaluate_binary_classifier(model, x_test, y_test):
+    """Evaluate the trained binary classifier"""
+    
+    # Predict
+    y_pred_prob = model.predict(x_test).flatten()
+    y_pred = (y_pred_prob > 0.5).astype(int)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    auc_score = roc_auc_score(y_test, y_pred_prob)
+    
+    # Classification report
+    report = classification_report(
+        y_test, y_pred,
+        target_names=['No ALS (0)', 'ALS (1)'],
+        output_dict=False
+    )
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    
+    # Detailed metrics
+    tn, fp, fn, tp = cm.ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    f1_score = 2 * (precision * sensitivity) / (precision + sensitivity) if (precision + sensitivity) > 0 else 0
+    
+    print(f"\n{'='*60}")
+    print("MODEL EVALUATION RESULTS")
+    print(f"{'='*60}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"AUC Score: {auc_score:.4f}")
+    print(f"Sensitivity/Recall: {sensitivity:.4f}")
+    print(f"Specificity: {specificity:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"F1-Score: {f1_score:.4f}")
+    print(f"\nConfusion Matrix:")
+    print(f"True Negatives: {tn}")
+    print(f"False Positives: {fp}")
+    print(f"False Negatives: {fn}")
+    print(f"True Positives: {tp}")
+    print(f"\nClassification Report:")
+    print(report)
+    
+    # Plot confusion matrix
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['No ALS', 'ALS'],
+                yticklabels=['No ALS', 'ALS'])
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Plot ROC curve
+    from sklearn.metrics import roc_curve
+    fpr, tpr, thresholds = roc_curve(y_test, y_pred_prob)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, label=f'ROC curve (AUC = {auc_score:.3f})')
+    plt.plot([0, 1], [0, 1], 'k--', label='Random classifier')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc='lower right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('roc_curve.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return {
+        'accuracy': accuracy,
+        'auc': auc_score,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'precision': precision,
+        'f1_score': f1_score,
+        'confusion_matrix': cm,
+        'classification_report': report
+    }
+
+def plot_training_history(history):
+    """Plot training history with multiple metrics"""
+    
+    metrics = ['loss', 'accuracy', 'auc', 'precision', 'recall']
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    for idx, metric in enumerate(metrics):
+        ax = axes[idx]
+        
+        # Plot training and validation metrics
+        if metric in history.history:
+            ax.plot(history.history[metric], label=f'Train {metric}')
+            
+            val_metric = f'val_{metric}'
+            if val_metric in history.history:
+                ax.plot(history.history[val_metric], label=f'Validation {metric}')
+        
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(metric.capitalize())
+        ax.set_title(f'{metric.capitalize()} over Epochs')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    # Remove empty subplot if needed
+    if len(metrics) < 6:
+        axes[-1].set_visible(False)
+    
+    plt.tight_layout()
+    plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# Example usage functions
+def example_usage_1():
+    """Example 1: Loading from two separate directories"""
+    print("Example 1: Loading from directories")
+    print("="*60)
+    
+    # Initialize data loader
+    loader = EMGDataLoader()
+    
+    # Load data from directories (assuming same filenames in both)
+    data_dir = "C:/Users/catas/OneDrive - Clemson University/Uni/Bioinstrumentation Lab/FaceValue/ALSdata/X_train.pkl"  # Directory containing EMG .pkl files
+    labels_dir = "C:/Users/catas/OneDrive - Clemson University/Uni/Bioinstrumentation Lab/FaceValue/ALSdata/y_train.pkl"  # Directory containing label .pkl files
+    
+    try:
+        x_data, y_data = loader.load_from_directories(data_dir, labels_dir)
+    except Exception as e:
+        print(f"Error loading from directories: {e}")
+        print("Creating synthetic data for demonstration...")
+        x_data, y_data = create_synthetic_data()
+
+def example_usage_2():
+    """Example 2: Loading with explicit file lists"""
+    print("\nExample 2: Loading with file lists")
+    print("="*60)
+    
+    # Initialize data loader
+    loader = EMGDataLoader()
+    
+    # Example file lists (replace with your actual file paths)
+    data_files = [
+        "data/emg_sample_001.pkl",
+        "data/emg_sample_002.pkl",
+        "data/emg_sample_003.pkl",
+        # Add more files...
+    ]
+    
+    label_files = [
+        "labels/label_sample_001.pkl",
+        "labels/label_sample_002.pkl",
+        "labels/label_sample_003.pkl",
+        # Add more files...
+    ]
+    
+    try:
+        x_data, y_data = loader.load_data_and_labels(data_files, label_files)
+    except Exception as e:
+        print(f"Error loading file lists: {e}")
+        print("Creating synthetic data for demonstration...")
+        x_data, y_data = create_synthetic_data()
+
+def create_synthetic_data(num_samples=200, sequence_length=1000):
+    """Create synthetic EMG data for demonstration"""
+    print(f"Creating {num_samples} synthetic EMG samples...")
+    
+    x_data = []
+    y_data = []
+    
+    for i in range(num_samples):
+        # Generate time vector
+        t = np.linspace(0, 10, sequence_length)
+        
+        if i < num_samples // 2:  # ALS samples
+            # ALS pattern: higher frequency, more noise
+            base_freq = 20 + np.random.randn() * 5
+            signal = (np.sin(2 * np.pi * base_freq * t) +
+                     0.3 * np.sin(2 * np.pi * (base_freq * 2) * t) +
+                     0.7 * np.random.randn(sequence_length))
+            label = 1
+        else:  # Control samples
+            # Control pattern: lower frequency, less noise
+            base_freq = 10 + np.random.randn() * 2
+            signal = (np.sin(2 * np.pi * base_freq * t) +
+                     0.1 * np.sin(2 * np.pi * (base_freq * 2) * t) +
+                     0.3 * np.random.randn(sequence_length))
+            label = 0
+        
+        # Reshape to (sequence_length, 1)
+        x_data.append(signal.reshape(-1, 1))
+        y_data.append(label)
+    
+    x_data = np.array(x_data)
+    y_data = np.array(y_data)
+    
+    print(f"Created synthetic data:")
+    print(f"X shape: {x_data.shape}")
+    print(f"Y shape: {y_data.shape}")
+    print(f"Class distribution: ALS={sum(y_data==1)}, Control={sum(y_data==0)}")
+    
+    return x_data, y_data
+
+def main_pipeline():
+    """Main pipeline for EMG ALS classification"""
+    print("EMG ALS Classification Pipeline")
+    print("="*60)
+    
+    # Load your data here using one of the methods above
+    # For demonstration, we'll use synthetic data
+    
+    print("\n1. Loading Data...")
+    x_data, y_data = create_synthetic_data(num_samples=200, sequence_length=1000)
+    
+    print("\n2. Creating Sequences...")
+    loader = EMGDataLoader()
+    loader.x_data = x_data
+    loader.y_data = y_data
+    loader.num_samples = len(x_data)
+    
+    # Create sequences if needed (for long recordings)
+    # x_data, y_data = loader.create_sequences(sequence_length=256, step_size=128)
+    
+    print("\n3. Creating Balanced Splits...")
+    (x_train, y_train), (x_val, y_val), (x_test, y_test) = create_balanced_split(
+        x_data, y_data,
+        test_size=0.2,
+        val_size=0.2,
+        random_state=42
+    )
+    
+    print("\n4. Normalizing Data...")
+    scaler = StandardScaler()
+    
+    # Reshape for normalization
+    original_shape_train = x_train.shape
+    x_train_flat = x_train.reshape(-1, x_train.shape[-1])
+    x_train_norm = scaler.fit_transform(x_train_flat).reshape(original_shape_train)
+    
+    x_val_flat = x_val.reshape(-1, x_val.shape[-1])
+    x_val_norm = scaler.transform(x_val_flat).reshape(x_val.shape)
+    
+    x_test_flat = x_test.reshape(-1, x_test.shape[-1])
+    x_test_norm = scaler.transform(x_test_flat).reshape(x_test.shape)
+    
+    print("\n5. Building and Training Model...")
+    input_shape = (x_train_norm.shape[1], x_train_norm.shape[2])
+    model, history = train_binary_classifier(
+        x_train_norm, y_train,
+        x_val_norm, y_val,
+        input_shape
+    )
+    
+    print("\n6. Plotting Training History...")
+    plot_training_history(history)
+    
+    print("\n7. Evaluating Model...")
+    results = evaluate_binary_classifier(model, x_test_norm, y_test)
+    
+    print("\n8. Saving Model and Results...")
+    # Save the trained model
+    model.save('emg_als_classifier_final.h5')
+    print("Model saved as 'emg_als_classifier_final.h5'")
+    
+    # Save the scaler for future use
+    with open('emg_scaler.pkl', 'wb') as f:
+        pickle.dump(scaler, f)
+    print("Scaler saved as 'emg_scaler.pkl'")
+    
+    # Save results
+    with open('training_results.pkl', 'wb') as f:
+        pickle.dump({
+            'history': history.history,
+            'test_results': results,
+            'input_shape': input_shape,
+            'class_distribution': {
+                'train': Counter(y_train),
+                'val': Counter(y_val),
+                'test': Counter(y_test)
+            }
+        }, f)
+    print("Results saved as 'training_results.pkl'")
+    
+    return model, results
+
+def load_and_predict_new_data(model_path, scaler_path, new_data_files, new_label_files=None):
+    """Load a trained model and make predictions on new data"""
+    
+    # Load model and scaler
+    model = keras.models.load_model(model_path)
+    with open(scaler_path, 'rb') as f:
+        scaler = pickle.load(f)
+    
+    # Load new data
+    loader = EMGDataLoader()
+    x_new, y_new = loader.load_data_and_labels(new_data_files, new_label_files or new_data_files)
+    
+    # Normalize
+    original_shape = x_new.shape
+    x_new_flat = x_new.reshape(-1, x_new.shape[-1])
+    x_new_norm = scaler.transform(x_new_flat).reshape(original_shape)
+    
+    # Make predictions
+    predictions = model.predict(x_new_norm)
+    
+    # Convert probabilities to binary predictions
+    binary_predictions = (predictions > 0.5).astype(int).flatten()
+    
+    # Create results DataFrame
+    results_df = pd.DataFrame({
+        'sample_id': loader.sample_ids,
+        'prediction_probability': predictions.flatten(),
+        'predicted_class': binary_predictions,
+        'predicted_label': ['ALS' if p == 1 else 'No ALS' for p in binary_predictions]
+    })
+    
+    # Add true labels if available
+    if y_new is not None:
+        results_df['true_class'] = y_new
+        results_df['true_label'] = ['ALS' if y == 1 else 'No ALS' for y in y_new]
+        results_df['correct'] = results_df['predicted_class'] == results_df['true_class']
+        
+        accuracy = np.mean(results_df['correct'])
+        print(f"Accuracy on new data: {accuracy:.4f}")
+    
+    # Save results
+    results_df.to_csv('new_data_predictions.csv', index=False)
+    print("Predictions saved to 'new_data_predictions.csv'")
+    
+    return results_df
+
+if __name__ == "__main__":
+    # Run the main pipeline
+    model, results = main_pipeline()
+    
+    # Example of how to use the model on new data
+    print("\n" + "="*60)
+    print("To use the trained model on new data:")
+    print("""
+    # Prepare your new data files
+    new_data_files = ['path/to/new_emg1.pkl', 'path/to/new_emg2.pkl']
+    new_label_files = ['path/to/new_labels1.pkl', 'path/to/new_labels2.pkl']  # Optional
+    
+    # Load model and make predictions
+    results_df = load_and_predict_new_data(
+        model_path='emg_als_classifier_final.h5',
+        scaler_path='emg_scaler.pkl',
+        new_data_files=new_data_files,
+        new_label_files=new_label_files
+    )
+    
+    print(results_df)
+    """)
